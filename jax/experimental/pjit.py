@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 from enum import IntEnum
 import numpy as np
 from collections import OrderedDict, Counter
@@ -212,14 +213,16 @@ def pjit(fun: Callable,
     jaxpr, in_axis_resources_flat, out_axis_resources_flat = \
         _pjit_jaxpr(flat_fun, mesh, local_in_avals,
                     in_tree, hashable_pytree(in_axis_resources),
-                    HashableFunction(out_tree, closure=()), hashable_pytree(out_axis_resources))
+                    HashableFunction(out_tree, closure=()), hashable_pytree(out_axis_resources),
+                    maps._positional_semantics)
     params = dict(
         jaxpr=jaxpr,
         in_axis_resources=in_axis_resources_flat,
         out_axis_resources=out_axis_resources_flat,
         resource_env=resource_env,
         donated_invars=donated_invars,
-        name=flat_fun.__name__)
+        name=flat_fun.__name__,
+        positional_semantics=maps._positional_semantics)
     return args_flat, params, out_tree()
 
   @wraps(fun)
@@ -233,10 +236,20 @@ def pjit(fun: Callable,
     return _pjit_lower(
         params['jaxpr'], params['in_axis_resources'],
         params['out_axis_resources'], params['resource_env'],
-        params['donated_invars'], params['name'])
+        params['donated_invars'], params['name'], maps._positional_semantics)
   wrapped.lower = lower
 
   return wrapped
+
+
+@contextlib.contextmanager
+def _positions_are_global():
+  prev_positional = maps._positional_semantics
+  try:
+    maps._positional_semantics = maps._PositionalSemantics.GLOBAL
+    yield
+  finally:
+    maps._positional_semantics = prev_positional
 
 class _ListWithW(list):
   __slots__ = ('__weakref__',)
@@ -260,15 +273,18 @@ def flatten_axis_resources(what, tree, axis_resources, tupled_args):
 @lu.cache
 def _pjit_jaxpr(fun, mesh, local_in_avals,
                 in_tree, in_axis_resources_thunk,
-                out_tree, out_axis_resources_thunk):
+                out_tree, out_axis_resources_thunk,
+                positional_semantics):
   in_axis_resources_flat = flatten_axis_resources(
         "pjit in_axis_resources", in_tree,
         in_axis_resources_thunk(), tupled_args=True)
   _check_shapes_against_resources("pjit arguments", False, mesh.local_mesh.shape,
                                   local_in_avals, in_axis_resources_flat)
-  global_in_avals = local_to_global(mesh, local_in_avals, in_axis_resources_flat)
+  global_in_avals = local_to_global(positional_semantics, mesh,
+                                    local_in_avals, in_axis_resources_flat)
 
-  jaxpr, global_out_avals, consts = pe.trace_to_jaxpr_dynamic(fun, global_in_avals)
+  with _positions_are_global():
+    jaxpr, global_out_avals, consts = pe.trace_to_jaxpr_dynamic(fun, global_in_avals)
   jaxpr = core.ClosedJaxpr(jaxpr, consts)
 
   out_axis_resources_flat = flatten_axis_resources(
@@ -409,10 +425,11 @@ pjit_p.multiple_results = True
 
 def _pjit_call_impl(*args, jaxpr,
                     in_axis_resources, out_axis_resources,
-                    resource_env, donated_invars, name):
+                    resource_env, donated_invars, name,
+                    positional_semantics):
   compiled = _pjit_lower(
       jaxpr, in_axis_resources, out_axis_resources,
-      resource_env, donated_invars, name).compile()
+      resource_env, donated_invars, name, positional_semantics).compile()
   distributed_debug_log(("Running pjit'd function", name),
                         ("mesh", resource_env.physical_mesh))
   return compiled.unsafe_call(*args)
@@ -425,13 +442,14 @@ def _pjit_lower(
     out_axis_resources: Tuple[ParsedPartitionSpec, ...],
     resource_env,
     donated_invars,
-    name: str):
+    name: str,
+    positional_semantics):
   in_axes = [get_array_mapping(axes) for axes in in_axis_resources]
   out_axes = [get_array_mapping(axes) for axes in out_axis_resources]
   f = core.jaxpr_as_fun(jaxpr)
   f.__name__ = name
   fun = lu.wrap_init(f)
-  local_in_avals = global_to_local(resource_env.physical_mesh,
+  local_in_avals = global_to_local(positional_semantics, resource_env.physical_mesh,
                                    jaxpr.in_avals, in_axis_resources)
   return pxla.lower_mesh_computation(
       fun, name, resource_env.physical_mesh,
@@ -440,15 +458,15 @@ def _pjit_lower(
       do_resource_typecheck="pjit")
 
 
-def _pjit_abstract_eval(*args, jaxpr, out_axis_resources, resource_env, **_):
-  return global_to_local(resource_env.physical_mesh,
+def _pjit_abstract_eval(*args, jaxpr, out_axis_resources, resource_env, positional_semantics, **_):
+  return global_to_local(positional_semantics, resource_env.physical_mesh,
                          jaxpr.out_avals, out_axis_resources)
 pjit_p.def_abstract_eval(_pjit_abstract_eval)
 
 
 def _pjit_translation_rule(c, axis_env, in_nodes, name_stack, backend, name,
                            jaxpr, in_axis_resources, out_axis_resources,
-                           resource_env, donated_invars):
+                           resource_env, donated_invars, positional_semantics):
   mesh = resource_env.physical_mesh
   subc = xc.XlaBuilder(f"pjit_{name}")
 
@@ -479,7 +497,7 @@ def _pjit_batcher(insert_axis,
                   axis_size, axis_name, main_type,
                   vals_in, dims_in,
                   jaxpr, in_axis_resources, out_axis_resources,
-                  resource_env, donated_invars, name):
+                  resource_env, donated_invars, name, positional_semantics):
   # batch_jaxpr expects all batching dimensions to be equal to 0
   vals_in = [batching.moveaxis(x, d, 0) if d is not batching.not_mapped and d != 0
              else x for x, d in zip(vals_in, dims_in)]
@@ -502,7 +520,8 @@ def _pjit_batcher(insert_axis,
     out_axis_resources=out_axis_resources,
     resource_env=resource_env,
     donated_invars=donated_invars,
-    name=name)
+    name=name,
+    positional_semantics=positional_semantics)
   dims_out = [0 if batched else batching.not_mapped for batched in is_mapped_out]
   return vals_out, dims_out
 batching.axis_primitive_batchers[pjit_p] = partial(_pjit_batcher, False)
@@ -511,7 +530,7 @@ pxla.spmd_primitive_batchers[pjit_p] = partial(_pjit_batcher, True)
 
 def _pjit_jvp(primals_in, tangents_in,
               jaxpr, in_axis_resources, out_axis_resources,
-              resource_env, donated_invars, name):
+              resource_env, donated_invars, name, positional_semantics):
   is_nz_tangents_in = [type(t) is not ad.Zero for t in tangents_in]
   jaxpr_jvp, is_nz_tangents_out = ad.jvp_jaxpr(
       jaxpr, is_nz_tangents_in, instantiate=False)
@@ -527,7 +546,8 @@ def _pjit_jvp(primals_in, tangents_in,
       out_axis_resources=(*out_axis_resources, *_filter_zeros_out(out_axis_resources)),
       resource_env=resource_env,
       donated_invars=(*donated_invars, *_filter_zeros_in(donated_invars)),
-      name=wrap_name(name, 'jvp'))
+      name=wrap_name(name, 'jvp'),
+      positional_semantics=positional_semantics)
 
   primals_out, tangents_out = split_list(outputs, [-len(is_nz_tangents_out)])
   assert len(primals_out) == len(jaxpr.jaxpr.outvars)
@@ -538,7 +558,8 @@ ad.primitive_jvps[pjit_p] = _pjit_jvp
 
 
 def _pjit_partial_eval(trace, *in_tracers, jaxpr, in_axis_resources,
-                       out_axis_resources, resource_env, donated_invars, name):
+                       out_axis_resources, resource_env, donated_invars, name,
+                       positional_semantics):
   raise NotImplementedError("linearize, vjp, and grad of pjit not supported, "
                             "see https://github.com/google/jax/pull/6876")
 pe.custom_partial_eval_rules[pjit_p] = _pjit_partial_eval
@@ -657,10 +678,14 @@ def get_aval_sharding_proto(aval: core.AbstractValue,
       aval, array_mapping)
   return sharding_spec.sharding_proto()
 
-def global_to_local(mesh, avals, axes):
+def global_to_local(positional_semantics, mesh, avals, axes):
+  if positional_semantics == maps._PositionalSemantics.GLOBAL:
+    return avals
   return [mesh.global_to_local(get_array_mapping(aval_axes), aval)
           for aval, aval_axes in zip(avals, axes)]
 
-def local_to_global(mesh, avals, axes):
+def local_to_global(positional_semantics, mesh, avals, axes):
+  if positional_semantics == maps._PositionalSemantics.GLOBAL:
+    return avals
   return [mesh.local_to_global(get_array_mapping(aval_axes), aval)
           for aval, aval_axes in zip(avals, axes)]
