@@ -320,7 +320,7 @@ def _code_generator_and_avals(
     except Exception as e:
       # TODO(xjun): Use a more robust mechanism instead of replying on error
       # message.
-      if type(e) is TypeError and "external symbolic tensor" in str(e):
+      if type(e) is TypeError and "out of scope" in str(e):
         # TODO(b/193754660): this may happen if we are in a function context
         # Try to salvage the situation if we are just doing abstract_eval, maybe
         # for jax2tf.convert. We can do that if all the output_shapes are known.
