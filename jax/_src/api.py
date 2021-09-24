@@ -52,8 +52,8 @@ from .api_util import (flatten_fun, apply_flat_fun, flatten_fun_nokwargs,
 from . import traceback_util
 from .traceback_util import api_boundary
 from ..tree_util import (tree_map, tree_flatten, tree_unflatten, tree_structure,
-                        tree_transpose, tree_leaves, tree_multimap,
-                        treedef_is_leaf, treedef_children, Partial)
+                         tree_transpose, tree_leaves, tree_multimap,
+                         treedef_is_leaf, treedef_children, Partial, PyTreeDef)
 from .util import (unzip2, curry, safe_map, safe_zip, prod, split_list,
                    extend_name_stack, wrap_name, cache, wraps, HashableFunction)
 from jax._src.lib import jax_jit
@@ -97,8 +97,8 @@ F = TypeVar("F", bound=Callable)
 T = TypeVar("T")
 U = TypeVar("U")
 
-map = safe_map
-zip = safe_zip
+map, unsafe_map = safe_map, map
+zip, unsafe_zip = safe_zip, zip
 
 FLAGS = flags.FLAGS
 
@@ -317,9 +317,8 @@ def _prepare_jit(fun, static_argnums, static_argnames, donate_argnums,
 
   for arg in args_flat:
     _check_arg(arg)
-  flat_fun, out_tree = flatten_fun(f, in_tree)
 
-  return flat_fun, out_tree, args_flat, donated_invars
+  return f, in_tree, args_flat, donated_invars
 
 
 def _python_jit(
@@ -344,14 +343,18 @@ def _python_jit(
   def f_jitted(*args, **kwargs):
     if config.jax_disable_jit:
       return fun(*args, **kwargs)
-    flat_fun, out_tree, args_flat, donated_invars = _prepare_jit(
+    closed_fun, in_tree, args_flat, donated_invars = _prepare_jit(
         fun, static_argnums, static_argnames, donate_argnums, args, kwargs)
+    flat_fun, out_tree = flatten_fun(closed_fun, in_tree)
     out_flat = xla.xla_call(
         flat_fun, *args_flat,
         device=device, backend=backend, name=flat_fun.__name__,
         donated_invars=donated_invars, inline=inline)
     return tree_unflatten(out_tree(), out_flat)
 
+  f_jitted.lower = partial(_lower,
+                           fun, static_argnums, static_argnames, device,
+                           backend, donate_argnums, inline)
   return f_jitted
 
 
@@ -402,8 +405,9 @@ def _cpp_jit(
     # An alternative would be for cache_miss to accept from C++ the arguments
     # (dyn_args, donated_invars, args_flat, in_tree), since otherwise we have
     # work/code that is redundant between C++ and Python. We can try that later.
-    flat_fun, out_tree, args_flat, donated_invars = _prepare_jit(
+    closed_fun, in_tree, args_flat, donated_invars = _prepare_jit(
         fun, static_argnums, static_argnames, donate_argnums, args, kwargs)
+    flat_fun, out_tree = flatten_fun(closed_fun, in_tree)
     out_flat = xla.xla_call(
         flat_fun, *args_flat,
         device=device, backend=backend, name=flat_fun.__name__,
@@ -463,7 +467,94 @@ def _cpp_jit(
                              cache=_cpp_jit_cache)
   f_jitted = wraps(fun)(cpp_jitted_f)
 
+  f_jitted.lower = partial(_lower,
+                           fun, static_argnums, static_argnames, device,
+                           backend, donate_argnums, inline)
+
   return f_jitted
+
+
+class JitOptions(NamedTuple):
+  static_argnums: Union[int, Iterable[int], None]
+  static_argnames: Union[str, Iterable[str], None]
+  donate_argnums: Union[int, Iterable[int]]
+
+
+class JitLowered:
+  __slots__ = ['computation', 'options', 'source_fun', 'in_tree', 'out_tree']
+
+  computation: xla.XlaComputation
+  options: JitOptions
+  source_fun: Callable
+  in_tree: PyTreeDef
+  out_tree: PyTreeDef
+
+  def __init__(self, computation, options, source_fun, in_tree, out_tree):
+    self.computation = computation
+    self.options = options
+    self.source_fun = source_fun
+    self.in_tree = in_tree
+    self.out_tree = out_tree
+
+  def hlo(self):
+    if self.computation.is_trivial():
+      raise ValueError('A trivial computation has no HLO')
+    return self.computation.hlo.as_hlo_text()
+
+  def compile(self):
+    return JitCompiled(
+        self.computation.compile(), self.options, self.source_fun,
+        self.in_tree, self.out_tree)
+
+
+class JitCompiled:
+  __slots__ = ['computation', 'options', 'source_fun', 'in_tree', 'out_tree']
+
+  computation: xla.XlaComputation
+  options: JitOptions
+  source_fun: Callable
+  in_tree: PyTreeDef
+  out_tree: PyTreeDef
+
+  def __init__(self, computation, options, source_fun, in_tree, out_tree):
+    self.computation = computation
+    self.options = options
+    self.source_fun = source_fun
+    self.in_tree = in_tree
+    self.out_tree = out_tree
+
+  def hlo(self):
+    if self.computation.is_trivial():
+      raise ValueError('A trivial computation has no HLO')
+    return self.computation.xla_executable.hlo_modules()[0].to_string()
+
+  def __call__(self, *args, **kwargs):
+    _, in_tree, args_flat, _ = _prepare_jit(
+        self.source_fun, self.options.static_argnums,
+        self.options.static_argnames, self.options.donate_argnums,
+        args, kwargs)
+    if in_tree != self.in_tree:
+      # TODO(frostig): provide more info about the source function
+      raise TypeError(
+          f'function compiled for {self.in_tree}, called with {in_tree}')
+    out_flat = self.computation.call(*args_flat)
+    return tree_unflatten(self.out_tree, out_flat)
+
+
+def _lower(fun, static_argnums, static_argnames, device, backend,
+           donate_argnums, inline, *args, **kwargs):
+  closed_fun, in_tree, args_flat, donated_invars = _prepare_jit(
+      fun, static_argnums, static_argnames, donate_argnums, args, kwargs)
+  flat_fun, out_tree = flatten_fun(closed_fun, in_tree)
+
+  name = flat_fun.__name__
+  arg_specs = unsafe_map(xla.arg_spec, args_flat)
+
+  computation = xla.lower_xla_callable(
+      flat_fun, device, backend, name, donated_invars, *arg_specs)
+  options = JitOptions(static_argnums, static_argnames, donate_argnums)
+
+  return JitLowered(computation, options, fun, in_tree, out_tree())
 
 
 @contextmanager
